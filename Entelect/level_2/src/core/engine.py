@@ -4,7 +4,7 @@ from typing import Dict, List, Set, Tuple, Optional, Any
 from .models import LevelConfig, CellState, PlantSpec, Submission, TickEntry, PlantAction, ScoreResult
 from .geometry import get_spread_offsets, get_shade_offsets
 from .loader import ResourceLoader
-from .unlock_tree import UnlockTreeEvaluator
+from .unlock_tree import UnlockTreeEvaluator, AnimalEvaluator
 
 class SimulationEngine:
     def __init__(self, config: LevelConfig, loader: ResourceLoader):
@@ -14,6 +14,7 @@ class SimulationEngine:
         self.cols = config.cols
         self.total_ticks = config.ticks
         self.animals_enabled = config.animals_enabled
+        self.animal_evaluator = AnimalEvaluator(self.loader.animals, self.loader.classifications)
 
         # Deep copy initial grid state
         self.grid: Dict[Tuple[int, int], CellState] = {
@@ -223,7 +224,7 @@ class SimulationEngine:
             target_cell.last_spread_tick = tick
 
     def _update_unlocks(self):
-        # Evaluates unlock trees
+        # Evaluates animals and unlock trees
         counts: Dict[str, int] = {}
         coverages: Dict[str, float] = {}
         alive_total = 0
@@ -235,16 +236,26 @@ class SimulationEngine:
                     counts[spec.plant] = counts.get(spec.plant, 0) + 1
                     alive_total += 1
 
-        total_cells = len(self.grid)
+        total_cells = self.rows * self.cols
         for plant_name, cnt in counts.items():
             coverages[plant_name] = cnt / total_cells if total_cells > 0 else 0.0
 
         dead_matter_count = sum(1 for c in self.grid.values() if c.dead_matter)
+        burnt_soil_count = sum(1 for c in self.grid.values() if c.soil == 3)
         context = {
             "plant_counts": counts,
             "plant_coverages": coverages,
-            "feature_counts": {"dead_matter": dead_matter_count}
+            "total_cells": total_cells,
+            "total_alive": alive_total,
+            "feature_counts": {
+                "dead_matter": dead_matter_count,
+                "burnt_soil": burnt_soil_count
+            }
         }
+
+        # Update animals if enabled
+        if self.animals_enabled:
+            self.active_animals = self.animal_evaluator.evaluate_all(context)
 
         evaluator = UnlockTreeEvaluator(
             unlocked_species=self.unlocked_species,
@@ -252,33 +263,33 @@ class SimulationEngine:
             active_events=self.active_events
         )
 
-        for item in self.loader.unlock_conditions:
-            p_name = item.get("plant", "")
-            if p_name not in self.unlocked_species:
-                if evaluator.evaluate(item.get("unlock", {}), context):
-                    self.unlocked_species.add(p_name)
+        # Multi-pass cascade
+        changed = True
+        while changed:
+            changed = False
+            for item in self.loader.unlock_conditions:
+                p_name = item.get("plant", "")
+                if p_name not in self.unlocked_species:
+                    if evaluator.evaluate(item.get("unlock", {}), context):
+                        self.unlocked_species.add(p_name)
+                        evaluator.unlocked_species.add(p_name)
+                        changed = True
 
     def calculate_score(self) -> ScoreResult:
-        # Tally final state at tick 500
+        # Tally final state at tick T
         species_counts: Dict[int, int] = {}
         total_alive = 0
         longevity_sum = 0.0
 
         T = self.total_ticks
-        k = 1.0  # standard linear scaling parameter
-        alpha = 1.0
-
-        # C_max is total habitable cells for starter plants (700)
-        c_max = len(self.habitable_coords)
+        c_max = self.rows * self.cols
 
         for cell in self.grid.values():
             if cell.plant_index is not None:
                 idx = cell.plant_index
                 species_counts[idx] = species_counts.get(idx, 0) + 1
                 total_alive += 1
-                # Plant lifespan l_ij
-                l_ij = cell.plant_age
-                longevity_sum += (l_ij / T) ** k
+                longevity_sum += cell.plant_age
 
         if total_alive == 0:
             return ScoreResult(
@@ -292,21 +303,20 @@ class SimulationEngine:
                 species_distribution={}
             )
 
-        # Entropy H with base K = number of available species in level (5)
-        K = 5
+        # Shannon Entropy with base N = 31 (exact server formula)
+        N = 31
         entropy = 0.0
         for idx, count in species_counts.items():
             p_i = count / total_alive
             if p_i > 0:
-                entropy -= p_i * (math.log(p_i) / math.log(K))
+                entropy -= p_i * (math.log(p_i) / math.log(N))
 
-        # Sample size factor
-        coverage_ratio = min(1.0, total_alive / c_max)
-        sample_factor = coverage_ratio ** alpha
-        main_score = entropy * sample_factor
+        # Sample size factor (density_factor): C / C_max
+        density_factor = total_alive / c_max
+        main_score = entropy * density_factor
 
-        # Longevity score
-        longevity_score = longevity_sum / c_max
+        # Longevity score: sum(age) / (C_max * T)
+        longevity_score = longevity_sum / (c_max * T)
 
         # Final weighted score
         final_score = 0.8 * main_score + 0.2 * longevity_score

@@ -1,11 +1,17 @@
 import unittest
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
 from core.models import LevelConfig, CellState, PlantAction, TickEntry, Submission
 from core.loader import ResourceLoader
 from core.engine import SimulationEngine
 
 class TestSimulationEngine(unittest.TestCase):
     def setUp(self):
-        self.loader = ResourceLoader(base_dir="Entelect")
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+        self.loader = ResourceLoader(base_dir=base_dir)
         # Create a small 10x10 mock grid
         cells = {}
         for r in range(10):

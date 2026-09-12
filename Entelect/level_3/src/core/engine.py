@@ -1,76 +1,10 @@
 from __future__ import annotations
 import math
-import operator
 from typing import Dict, List, Set, Tuple, Optional, Any
 from .models import LevelConfig, CellState, PlantSpec, Submission, TickEntry, PlantAction, ScoreResult
 from .geometry import get_spread_offsets, get_shade_offsets
 from .loader import ResourceLoader
-from .unlock_tree import UnlockTreeEvaluator
-
-OPS = {
-    ">=": operator.ge,
-    ">": operator.gt,
-    "<=": operator.le,
-    "<": operator.lt,
-    "==": operator.eq,
-    "=": operator.eq
-}
-
-def check_animal_condition(cond: Dict[str, Any], context: Dict[str, Any], classifications: Dict[str, List[str]]) -> bool:
-    c_type = cond.get("type", "")
-    op_func = OPS.get(cond.get("operator", ">="), operator.ge)
-    threshold = cond.get("threshold", 0)
-    
-    if c_type == "coverage":
-        species_list = cond.get("species", [])
-        total_cov = sum(context["plant_coverages"].get(s, 0.0) for s in species_list)
-        return op_func(total_cov, threshold)
-        
-    elif c_type == "count":
-        if "species" in cond:
-            species = cond["species"]
-            cnt = context["plant_counts"].get(species, 0)
-            return op_func(cnt, threshold)
-        elif "species_group" in cond:
-            groups = cond["species_group"]
-            all_species = set()
-            for g in groups:
-                if g in classifications:
-                    all_species.update(classifications[g])
-                else:
-                    all_species.add(g)
-            cnt = sum(context["plant_counts"].get(s, 0) for s in all_species)
-            return op_func(cnt, threshold)
-            
-    elif c_type == "group_coverage":
-        groups = cond.get("species_group", [])
-        all_species = set()
-        for g in groups:
-            if g in classifications:
-                all_species.update(classifications[g])
-            else:
-                all_species.add(g)
-        total_cov = sum(context["plant_coverages"].get(s, 0.0) for s in all_species)
-        return op_func(total_cov, threshold)
-        
-    elif c_type == "dominance":
-        total_alive = context.get("total_alive", 0)
-        if total_alive == 0:
-            return False
-        max_species_cnt = max(context["plant_counts"].values()) if context["plant_counts"] else 0
-        return (max_species_cnt / total_alive) >= threshold
-
-    return False
-
-def check_animal_requirements(req: Dict[str, Any], context: Dict[str, Any], classifications: Dict[str, List[str]]) -> bool:
-    req_type = req.get("type", "AND").upper()
-    conds = req.get("conditions", [])
-    if req_type == "AND":
-        return all(check_animal_condition(c, context, classifications) for c in conds)
-    elif req_type == "OR":
-        return any(check_animal_condition(c, context, classifications) for c in conds)
-    return False
-
+from .unlock_tree import UnlockTreeEvaluator, AnimalEvaluator
 
 class SimulationEngine:
     def __init__(self, config: LevelConfig, loader: ResourceLoader):
@@ -80,16 +14,12 @@ class SimulationEngine:
         self.cols = config.cols
         self.total_ticks = config.ticks
         self.animals_enabled = config.animals_enabled
+        self.animal_evaluator = AnimalEvaluator(self.loader.animals, self.loader.classifications)
 
         # Deep copy initial grid state
         self.grid: Dict[Tuple[int, int], CellState] = {
             coord: cell.copy() for coord, cell in config.cells.items()
         }
-
-        # Fast tracking sets
-        self.occupied_coords: Set[Tuple[int, int]] = set()
-        self.tree_coords: Set[Tuple[int, int]] = set()
-        self.dead_matter_coords: Set[Tuple[int, int]] = set()
 
         # Simulation tracking
         self.current_tick = 0
@@ -115,9 +45,6 @@ class SimulationEngine:
         self.grid = {
             coord: cell.copy() for coord, cell in self.config.cells.items()
         }
-        self.occupied_coords.clear()
-        self.tree_coords.clear()
-        self.dead_matter_coords.clear()
         self.current_tick = 0
         self.current_season = "Spring"
         self.active_events.clear()
@@ -151,129 +78,95 @@ class SimulationEngine:
                 elif cmd_type == "event":
                     self.active_events.add(cmd.get("event", ""))
 
-        # Check animal appearances & species unlocks
-        self._update_animals_and_unlocks()
+        # Check unlocks
+        self._update_unlocks()
 
         # --- Phase 2: Player Actions (Max 20) ---
         applied_actions = player_actions[:20]
         for act in applied_actions:
             coord = (act.row, act.col)
             if coord not in self.grid:
-                continue
+                continue  # Confirmed rule: silently drop invalid/unlisted coordinates
 
             spec = self.loader.plants.get(act.plant_index)
             if not spec:
                 continue
 
+            # Must be unlocked
             if spec.plant not in self.unlocked_species:
                 continue
 
+            # Soil match check (confirmed rule: placement legality is soil match)
             cell = self.grid[coord]
             if cell.soil not in spec.preferred_soil:
                 continue
 
-            # Place plant: replaces existing plant and resets age to 0
-            cell.plant_index = spec.index
+            # Overwrite incumbent plant
+            cell.plant_index = act.plant_index
             cell.plant_age = 0
-            cell.dead_matter = False
             cell.last_spread_tick = tick
-            self.occupied_coords.add(coord)
-            if coord in self.dead_matter_coords:
-                self.dead_matter_coords.discard(coord)
-
-            if spec.plant == "Oak Tree":
-                self.tree_coords.add(coord)
-            elif coord in self.tree_coords:
-                self.tree_coords.discard(coord)
-
-        # Fast path: if no occupied cells and no dead matter, early return
-        if not self.occupied_coords and not self.dead_matter_coords:
-            return
 
         # --- Phase 3: Recalculate Shade ---
         self._recalculate_shade()
 
-        # --- Phase 4: Autonomous Spreading ---
+        # --- Phase 4: Autonomous Spread ---
         self._resolve_spreading(tick)
 
-        # --- Phase 5: Shade Survival Check ---
-        dead_from_shade = []
-        for coord in list(self.occupied_coords):
-            cell = self.grid[coord]
-            if cell.is_shaded and cell.plant_index is not None:
+        # --- Phase 5: Immediate Shade Weakness Check ---
+        for cell in self.grid.values():
+            if cell.plant_index is not None and cell.is_shaded:
                 spec = self.loader.plants.get(cell.plant_index)
                 if spec:
                     for w in spec.weaknesses:
                         if w.get("type") == "no_shade_survival":
+                            # Grass dies in shade
                             cell.plant_index = None
                             cell.plant_age = 0
                             cell.dead_matter = True
-                            dead_from_shade.append(coord)
                             break
-        for coord in dead_from_shade:
-            self.occupied_coords.discard(coord)
-            self.tree_coords.discard(coord)
-            self.dead_matter_coords.add(coord)
 
         # --- Phase 6: Nutrient Consumption & Regeneration ---
-        starved_coords = []
-        for coord in list(self.occupied_coords):
-            cell = self.grid[coord]
-            drain = 0.5 if cell.dead_matter else 1.0
-            cell.nutrients -= drain
-            if cell.nutrients <= 0.0:
-                cell.nutrients = 0.0
-                cell.plant_index = None
-                cell.plant_age = 0
-                cell.dead_matter = True
-                starved_coords.append(coord)
+        for cell in self.grid.values():
+            if cell.plant_index is not None:
+                # Cell is occupied
+                drain = 0.5 if cell.dead_matter else 1.0
+                cell.nutrients -= drain
+                if cell.nutrients <= 0.0:
+                    # Plant dies of starvation
+                    cell.nutrients = 0.0
+                    cell.plant_index = None
+                    cell.plant_age = 0
+                    cell.dead_matter = True
+            elif cell.dead_matter:
+                # Cell is empty with dead matter: regenerate
+                cell.nutrients = min(100.0, cell.nutrients + 1.0)
 
-        for coord in starved_coords:
-            self.occupied_coords.discard(coord)
-            self.tree_coords.discard(coord)
-            self.dead_matter_coords.add(coord)
-
-        # Regenerate nutrients on empty dead matter cells
-        clean_dead_matter = []
-        for coord in list(self.dead_matter_coords):
-            if coord in self.occupied_coords:
-                continue
-            cell = self.grid[coord]
-            cell.nutrients = min(100.0, cell.nutrients + 1.0)
-            if cell.nutrients >= 100.0:
-                cell.dead_matter = False
-                clean_dead_matter.append(coord)
-        for coord in clean_dead_matter:
-            self.dead_matter_coords.discard(coord)
-
-        # --- Phase 7: Plant Maturation & Aging ---
-        for coord in self.occupied_coords:
-            cell = self.grid[coord]
-            cell.plant_age += 1
+        # --- Phase 7: Plant Maturation & Lifespan Aging ---
+        for cell in self.grid.values():
+            if cell.plant_index is not None:
+                cell.plant_age += 1
 
     def _recalculate_shade(self):
-        # Reset shade on active cells
+        # Reset shade
         for cell in self.grid.values():
             cell.is_shaded = False
 
-        if not self.tree_coords:
-            return
-
-        for r, c in self.tree_coords:
-            cell = self.grid.get((r, c))
-            if cell and cell.plant_index == 12:
+        # Mature Oak Trees cast shade
+        for (r, c), cell in self.grid.items():
+            if cell.plant_index == 12:  # Oak Tree
                 spec = self.loader.plants.get(12)
                 if spec and cell.plant_age >= spec.growth.time_to_maturity:
+                    # Cast shade radius 4
                     for dr, dc in get_shade_offsets(4):
                         target = (r + dr, c + dc)
                         if target in self.grid:
                             self.grid[target].is_shaded = True
 
     def _resolve_spreading(self, tick: int):
-        spread_events: List[Tuple[Tuple[int, int], int]] = []
+        # Determine which plants want to spread this tick
+        spread_events: List[Tuple[Tuple[int, int], int]] = []  # (target_coord, plant_index)
 
-        for coord in list(self.occupied_coords):
-            cell = self.grid[coord]
+        for (r, c), cell in self.grid.items():
             if cell.plant_index is None:
                 continue
 
@@ -282,86 +175,87 @@ class SimulationEngine:
                 continue
 
             growth = spec.growth
+            # Check maturity
             if cell.plant_age < growth.time_to_maturity:
                 continue
 
+            # Check spread rate interval
             effective_spread_rate = growth.spread_rate
+            # Check conditional modifiers (e.g. Orange Blossom in summer)
             for mod in growth.conditional_modifiers:
                 if mod.get("condition") == f"season_{self.current_season.lower()}":
                     effective_spread_rate = mod.get("spread_rate", effective_spread_rate)
 
-            # Animal effects on spread rate
-            if "Nectaris" in self.active_animals and spec.role == "Pollinator-dependent":
-                effective_spread_rate = max(1, int(effective_spread_rate / 1.5))
-            if "Barkskips" in self.active_animals and spec.plant in ("Oak Tree", "Purple Canopy Tree"):
-                effective_spread_rate = max(1, int(effective_spread_rate / 1.1))
-
+            # Check winter spread weakness
             if self.current_season == "Winter":
-                if any(w.get("type") == "no_winter_spread" for w in spec.weaknesses):
+                has_winter_weakness = any(w.get("type") == "no_winter_spread" for w in spec.weaknesses)
+                if has_winter_weakness:
                     continue
 
+            # Check shade spread weakness
             if cell.is_shaded:
-                if any(w.get("type") == "no_shade_spread" for w in spec.weaknesses):
+                has_shade_spread_weakness = any(w.get("type") == "no_shade_spread" for w in spec.weaknesses)
+                if has_shade_spread_weakness:
                     continue
 
+            # Check if this tick is a spread tick
             ticks_since_spread = tick - cell.last_spread_tick
             if ticks_since_spread >= effective_spread_rate:
                 cell.last_spread_tick = tick
-                r, c = coord
                 offsets = get_spread_offsets(growth.spread_type, growth.spread_range)
                 for dr, dc in offsets:
                     target_coord = (r + dr, c + dc)
                     if target_coord in self.grid:
                         target_cell = self.grid[target_coord]
+                        # Target soil must match preferred soil
                         if target_cell.soil in spec.preferred_soil:
+                            # Target must not be shaded if newcomer has shade weaknesses
                             if target_cell.is_shaded and any(
                                 w.get("type") in ("no_shade_survival", "no_shade_spread") for w in spec.weaknesses
                             ):
                                 continue
                             spread_events.append((target_coord, spec.index))
 
+        # Apply spread: confirmed rule: newcomer overwrites incumbent plant
         for target_coord, p_idx in spread_events:
             target_cell = self.grid[target_coord]
             target_cell.plant_index = p_idx
             target_cell.plant_age = 0
             target_cell.last_spread_tick = tick
-            self.occupied_coords.add(target_coord)
-            if p_idx == 12:
-                self.tree_coords.add(target_coord)
-            elif target_coord in self.tree_coords:
-                self.tree_coords.discard(target_coord)
 
-    def _update_animals_and_unlocks(self):
+    def _update_unlocks(self):
+        # Evaluates animals and unlock trees
         counts: Dict[str, int] = {}
         coverages: Dict[str, float] = {}
-        alive_total = len(self.occupied_coords)
+        alive_total = 0
 
-        for coord in self.occupied_coords:
-            cell = self.grid[coord]
+        for cell in self.grid.values():
             if cell.plant_index is not None:
                 spec = self.loader.plants.get(cell.plant_index)
                 if spec:
                     counts[spec.plant] = counts.get(spec.plant, 0) + 1
+                    alive_total += 1
 
-        total_cells = len(self.grid)
+        total_cells = self.rows * self.cols
         for plant_name, cnt in counts.items():
             coverages[plant_name] = cnt / total_cells if total_cells > 0 else 0.0
 
-        dead_matter_count = len(self.dead_matter_coords)
+        dead_matter_count = sum(1 for c in self.grid.values() if c.dead_matter)
+        burnt_soil_count = sum(1 for c in self.grid.values() if c.soil == 3)
         context = {
             "plant_counts": counts,
             "plant_coverages": coverages,
-            "feature_counts": {"dead_matter": dead_matter_count},
-            "total_alive": alive_total
+            "total_cells": total_cells,
+            "total_alive": alive_total,
+            "feature_counts": {
+                "dead_matter": dead_matter_count,
+                "burnt_soil": burnt_soil_count
+            }
         }
 
-        # Update animals
+        # Update animals if enabled
         if self.animals_enabled:
-            current_animals = set()
-            for animal in self.loader.animals:
-                if check_animal_requirements(animal.get("requirements", {}), context, self.loader.classifications):
-                    current_animals.add(animal["name"])
-            self.active_animals = current_animals
+            self.active_animals = self.animal_evaluator.evaluate_all(context)
 
         evaluator = UnlockTreeEvaluator(
             unlocked_species=self.unlocked_species,
@@ -369,30 +263,33 @@ class SimulationEngine:
             active_events=self.active_events
         )
 
-        for item in self.loader.unlock_conditions:
-            p_name = item.get("plant", "")
-            if p_name not in self.unlocked_species:
-                if evaluator.evaluate(item.get("unlock", {}), context):
-                    self.unlocked_species.add(p_name)
+        # Multi-pass cascade
+        changed = True
+        while changed:
+            changed = False
+            for item in self.loader.unlock_conditions:
+                p_name = item.get("plant", "")
+                if p_name not in self.unlocked_species:
+                    if evaluator.evaluate(item.get("unlock", {}), context):
+                        self.unlocked_species.add(p_name)
+                        evaluator.unlocked_species.add(p_name)
+                        changed = True
 
     def calculate_score(self) -> ScoreResult:
+        # Tally final state at tick T
         species_counts: Dict[int, int] = {}
         total_alive = 0
         longevity_sum = 0.0
 
         T = self.total_ticks
-        k = 1.0
-        alpha = 1.0
-        c_max = len(self.habitable_coords)
+        c_max = self.rows * self.cols
 
-        for coord in self.occupied_coords:
-            cell = self.grid[coord]
+        for cell in self.grid.values():
             if cell.plant_index is not None:
                 idx = cell.plant_index
                 species_counts[idx] = species_counts.get(idx, 0) + 1
                 total_alive += 1
-                l_ij = cell.plant_age
-                longevity_sum += (l_ij / T) ** k
+                longevity_sum += cell.plant_age
 
         if total_alive == 0:
             return ScoreResult(
@@ -406,17 +303,22 @@ class SimulationEngine:
                 species_distribution={}
             )
 
-        K = 5
+        # Shannon Entropy with base N = 31 (exact server formula)
+        N = 31
         entropy = 0.0
         for idx, count in species_counts.items():
             p_i = count / total_alive
             if p_i > 0:
-                entropy -= p_i * (math.log(p_i) / math.log(K))
+                entropy -= p_i * (math.log(p_i) / math.log(N))
 
-        coverage_ratio = min(1.0, total_alive / c_max)
-        sample_factor = coverage_ratio ** alpha
-        main_score = entropy * sample_factor
-        longevity_score = longevity_sum / c_max
+        # Sample size factor (density_factor): C / C_max
+        density_factor = total_alive / c_max
+        main_score = entropy * density_factor
+
+        # Longevity score: sum(age) / (C_max * T)
+        longevity_score = longevity_sum / (c_max * T)
+
+        # Final weighted score
         final_score = 0.8 * main_score + 0.2 * longevity_score
         leaderboard_score = int(round(final_score * 1_000_000_000))
 
@@ -430,3 +332,4 @@ class SimulationEngine:
             leaderboard_score=leaderboard_score,
             species_distribution=species_counts
         )
+

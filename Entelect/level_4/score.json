@@ -1,0 +1,20 @@
+{
+  "level": 4,
+  "alive_count": 3810,
+  "habitable_count": 5406,
+  "coverage_pct": 70.4772475027747,
+  "entropy": 0.5176948407982387,
+  "main_score": 0.032873622390688154,
+  "longevity_score": 0.0015300833333333334,
+  "final_score": 0.02660491457921719,
+  "leaderboard_score": 26604915,
+  "species_distribution": {
+    "12": 975,
+    "6": 45,
+    "11": 325,
+    "19": 650,
+    "9": 637,
+    "5": 430,
+    "1": 748
+  }
+}

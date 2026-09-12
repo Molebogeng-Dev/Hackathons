@@ -11,6 +11,74 @@ OPS = {
     "=": operator.eq
 }
 
+class AnimalEvaluator:
+    def __init__(self, animals: List[Dict[str, Any]], classifications: Dict[str, List[str]]):
+        self.animals = animals
+        self.classifications = classifications
+
+    def _resolve_species_list(self, items: List[str]) -> List[str]:
+        species = []
+        for it in items:
+            if it in self.classifications:
+                species.extend(self.classifications[it])
+            else:
+                species.append(it)
+        return list(set(species))
+
+    def evaluate_all(self, context: Dict[str, Any]) -> Set[str]:
+        counts = context.get("plant_counts", {})
+        total_cells = context.get("total_cells", 1)
+        total_alive = context.get("total_alive", 0)
+
+        active = set()
+        for a in self.animals:
+            req = a.get("requirements", {})
+            if self._eval_req(req, counts, total_cells, total_alive):
+                active.add(a.get("name", a.get("id", "")))
+        return active
+
+    def _eval_req(self, req: Dict[str, Any], counts: Dict[str, int], total_cells: int, total_alive: int) -> bool:
+        rtype = req.get("type", "").upper()
+        if rtype == "OR":
+            return any(self._eval_req(c, counts, total_cells, total_alive) for c in req.get("conditions", []))
+        elif rtype == "AND":
+            return all(self._eval_req(c, counts, total_cells, total_alive) for c in req.get("conditions", []))
+
+        cond_type = req.get("type", "")
+        op = OPS.get(req.get("operator", ">="), operator.ge)
+        thresh = req.get("threshold", 0)
+
+        if cond_type == "coverage":
+            species = req.get("species", [])
+            total_cnt = sum(counts.get(s, 0) for s in species)
+            cov = total_cnt / total_cells if total_cells > 0 else 0.0
+            return op(cov, thresh)
+
+        elif cond_type == "group_coverage":
+            group = req.get("species_group", [])
+            resolved = self._resolve_species_list(group)
+            total_cnt = sum(counts.get(s, 0) for s in resolved)
+            cov = total_cnt / total_cells if total_cells > 0 else 0.0
+            return op(cov, thresh)
+
+        elif cond_type == "count":
+            if "species" in req:
+                cnt = counts.get(req["species"], 0)
+            elif "species_group" in req:
+                resolved = self._resolve_species_list(req["species_group"])
+                cnt = sum(counts.get(s, 0) for s in resolved)
+            else:
+                cnt = 0
+            return op(cnt, thresh)
+
+        elif cond_type == "dominance":
+            if total_alive <= 0:
+                return False
+            max_cnt = max(counts.values()) if counts else 0
+            return (max_cnt / total_alive) >= thresh
+
+        return False
+
 class UnlockTreeEvaluator:
     def __init__(self, unlocked_species: Set[str], active_animals: Set[str], active_events: Set[str]):
         self.unlocked_species = set(unlocked_species)
@@ -68,4 +136,3 @@ class UnlockTreeEvaluator:
             return op_func(f_counts.get(feat, 0), target_val)
 
         return False
-
